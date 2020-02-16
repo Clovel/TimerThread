@@ -1,15 +1,24 @@
-#include "timerthread.hxx"
+/**
+ * TimerThread class implementation
+ *
+ * @file TimerThread.cxx
+ */
+
+/* Includes -------------------------------------------- */
+#include "TimerThread.hxx"
 
 #include <cassert>
+#include <iostream>
 
+#include <cstring>
+
+/* TimerThread implementation -------------------------- */
 void TimerThread::timerThreadWorker()
 {
     ScopedLock lock(sync);
 
-    while (!done)
-    {
-        if (queue.empty())
-        {
+    while (!done) {
+        if (queue.empty()) {
             // Wait for done or work
             wakeUp.wait(lock, [this] {
                 return done || !queue.empty();
@@ -17,11 +26,10 @@ void TimerThread::timerThreadWorker()
             continue;
         }
 
-        auto queueHead = queue.begin();
-        Timer &timer = *queueHead;
-        auto now = Clock::now();
-        if (now >= timer.next)
-        {
+        auto   queueHead = queue.begin();
+        Timer &timer     = *queueHead;
+        auto   now       = Clock::now();
+        if (now >= timer.next) {
             queue.erase(queueHead);
 
             // Mark it as running to handle racing destroy
@@ -32,22 +40,18 @@ void TimerThread::timerThreadWorker()
             timer.handler();
             lock.lock();
 
-            if (timer.running)
-            {
+            if (timer.running) {
                 timer.running = false;
 
                 // If it is periodic, schedule a new one
-                if (timer.period.count() > 0)
-                {
+                if (timer.period.count() > 0) {
                     timer.next = timer.next + timer.period;
                     queue.emplace(timer);
                 } else {
                     // Not rescheduling, destruct it
                     active.erase(timer.id);
                 }
-            }
-            else
-            {
+            } else {
                 // timer.running changed!
                 //
                 // Running was set to false, destroy was called
@@ -69,9 +73,9 @@ void TimerThread::timerThreadWorker()
 }
 
 TimerThread::TimerThread()
-    : nextId(no_timer + 1)
-    , queue()
-    , done(false)
+    : nextId(no_timer + 1),
+    queue(),
+    done(false)
 {
 }
 
@@ -80,8 +84,7 @@ TimerThread::~TimerThread()
     ScopedLock lock(sync);
 
     // The worker might not be running
-    if (worker.joinable())
-    {
+    if (worker.joinable()) {
         done = true;
         lock.unlock();
         wakeUp.notify_all();
@@ -97,35 +100,33 @@ TimerThread::~TimerThread()
     }
 }
 
-TimerThread::timer_id_t TimerThread::setInterval(
-        handler_type handler, time_us_t period)
+TimerThread::timer_id_t TimerThread::setInterval(handler_type handler, time_us_t period)
 {
     return addTimer(period, period, std::move(handler));
 }
 
-TimerThread::timer_id_t TimerThread::setTimeout(
-        handler_type handler, time_us_t timeout)
+TimerThread::timer_id_t TimerThread::setTimeout(handler_type handler, time_us_t timeout)
 {
     return addTimer(timeout, 0, std::move(handler));
 }
 
-TimerThread::timer_id_t TimerThread::addTimer(
-        time_us_t msDelay,
-        time_us_t msPeriod,
-        handler_type handler)
+TimerThread::timer_id_t TimerThread::addTimer(time_us_t    msDelay,
+                                                time_us_t    msPeriod,
+                                                handler_type handler)
 {
     ScopedLock lock(sync);
 
     // Start thread when first timer is requested
-    if (!worker.joinable())
+    if (!worker.joinable()) {
         worker = std::thread(&TimerThread::timerThreadWorker, this);
+    }
 
     // Assign an ID and insert it into function storage
-    auto id = nextId++;
+    auto id   = nextId++;
     auto iter = active.emplace(id, Timer(id,
-            Clock::now() + Duration(msDelay),
-            Duration(msPeriod),
-            std::move(handler)));
+                                            Clock::now() + Duration(msDelay),
+                                            Duration(msPeriod),
+                                            std::move(handler)));
 
     // Insert a reference to the Timer into ordering queue
     Queue::iterator place = queue.emplace(iter.first->second);
@@ -136,8 +137,9 @@ TimerThread::timer_id_t TimerThread::addTimer(
 
     lock.unlock();
 
-    if (needNotify)
+    if (needNotify) {
         wakeUp.notify_all();
+    }
 
     return id;
 }
@@ -145,46 +147,89 @@ TimerThread::timer_id_t TimerThread::addTimer(
 bool TimerThread::clearTimer(timer_id_t id)
 {
     ScopedLock lock(sync);
-    auto i = active.find(id);
+    auto       i = active.find(id);
+
     return destroy_impl(lock, i, true);
 }
 
 void TimerThread::clear()
 {
     ScopedLock lock(sync);
-    while (!active.empty())
-    {
+
+    while (!active.empty()) {
         destroy_impl(lock, active.begin(),
-                     queue.size() == 1);
+                        queue.size() == 1);
     }
+}
+
+int TimerThread::setScheduling(const int &pPolicy, const int &pPriority)
+{
+    sched_param sch_params;
+    int         res = 0;
+
+    sch_params.sched_priority = pPriority;
+
+    res = pthread_setschedparam(worker.native_handle(), pPolicy, &sch_params);
+    if (res) {
+        std::cerr << "[ERROR] <TimerThread> Failed to set Thread scheduling : " << std::strerror(errno) << std::endl;
+    }
+
+    return res;
+}
+
+int TimerThread::scheduling(int * const pPolicy, int * const pPriority) noexcept
+{
+    sched_param sch_params;
+    int         lPolicy = 0, res = 0;
+
+    /* Checking arguments */
+    if (nullptr == pPolicy) {
+        std::cerr << "[ERROR] <TimerThread::scheduling> pPolicy = nullptr !" << std::endl;
+        return 255; /* ERROR */
+    } else if (nullptr == pPriority) {
+        std::cerr << "[ERROR] <TimerThread::scheduling> pPriority = nullptr !" << std::endl;
+        return 255; /* ERROR */
+    }
+
+    res = pthread_setschedparam(worker.native_handle(), lPolicy, &sch_params);
+    if (res) {
+        std::cerr << "[ERROR] <TimerThread> Failed to get Thread scheduling : " << std::strerror(errno) << std::endl;
+        *pPriority = 0; /* 0 not possible, indicates an error */
+    } else {
+        *pPriority = sch_params.sched_priority; /* Should be between 1 & 99 */
+    }
+
+    return res;
 }
 
 std::size_t TimerThread::size() const noexcept
 {
     ScopedLock lock(sync);
+
     return active.size();
 }
 
 bool TimerThread::empty() const noexcept
 {
     ScopedLock lock(sync);
+
     return active.empty();
 }
 
 // NOTE: if notify is true, returns with lock unlocked
-bool TimerThread::destroy_impl(ScopedLock& lock,
-                               TimerMap::iterator i,
-                               bool notify)
+bool TimerThread::destroy_impl(ScopedLock        &lock,
+                                TimerMap::iterator i,
+                                bool               notify)
 {
     assert(lock.owns_lock());
 
-    if (i == active.end())
+    if (i == active.end()) {
         return false;
+    }
 
-    Timer& timer = i->second;
+    Timer &timer = i->second;
 
-    if (timer.running)
-    {
+    if (timer.running) {
         // A callback is in progress for this Timer,
         // so flag it for deletion in the worker
         timer.running = false;
@@ -194,14 +239,11 @@ bool TimerThread::destroy_impl(ScopedLock& lock,
 
         // Block until the callback is finished
         timer.waitCond->wait(lock);
-    }
-    else
-    {
+    } else {
         queue.erase(timer);
         active.erase(i);
 
-        if (notify)
-        {
+        if (notify) {
             lock.unlock();
             wakeUp.notify_all();
         }
@@ -210,36 +252,37 @@ bool TimerThread::destroy_impl(ScopedLock& lock,
     return true;
 }
 
-TimerThread& TimerThread::global()
+TimerThread &TimerThread::global()
 {
     static TimerThread singleton;
+
     return singleton;
 }
 
 // TimerThread::Timer implementation
 TimerThread::Timer::Timer(timer_id_t id)
-    : id(id)
-    , running(false)
+    : id(id),
+    running(false)
 {
 }
 
-TimerThread::Timer::Timer(Timer&& r) noexcept
-    : id(std::move(r.id))
-    , next(std::move(r.next))
-    , period(std::move(r.period))
-    , handler(std::move(r.handler))
-    , running(std::move(r.running))
+TimerThread::Timer::Timer(Timer &&r) noexcept
+    : id(std::move(r.id)),
+    next(std::move(r.next)),
+    period(std::move(r.period)),
+    handler(std::move(r.handler)),
+    running(std::move(r.running))
 {
 }
 
-TimerThread::Timer::Timer(timer_id_t id,
-                          Timestamp next,
-                          Duration period,
-                          handler_type handler) noexcept
-    : id(id)
-    , next(next)
-    , period(period)
-    , handler(std::move(handler))
-    , running(false)
+TimerThread::Timer::Timer(timer_id_t   id,
+                            Timestamp    next,
+                            Duration     period,
+                            handler_type handler) noexcept
+    : id(id),
+    next(next),
+    period(period),
+    handler(std::move(handler)),
+    running(false)
 {
 }
