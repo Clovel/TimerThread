@@ -1,4 +1,4 @@
-#include "timerthread.hxx"
+#include "TimerThread.hxx"
 
 #include <iostream>
 
